@@ -146,6 +146,30 @@ gh_api_put() {
     echo "$response"
 }
 
+gh_api_delete() {
+    local endpoint="$1"
+    local response
+
+    if [[ "$USE_GH_CLI" == true ]]; then
+        response=$(gh api -X DELETE "$endpoint" 2>&1) || {
+            echo "[ERROR] API DELETE failed: $endpoint" >&2
+            echo "$response" >&2
+            return 1
+        }
+    else
+        response=$(curl -sSf -X DELETE \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com$endpoint" 2>&1) || {
+            echo "[ERROR] API DELETE failed: $endpoint" >&2
+            echo "$response" >&2
+            return 1
+        }
+    fi
+
+    echo "$response"
+}
+
 # === SHA RESOLUTION ===
 is_pinned() {
     local ref="$1"
@@ -464,10 +488,15 @@ process_remote_repo() {
     }
 
     # Process each workflow file
-    local pr_table="| File | Action | Change |\n|------|--------|--------|\n"
-    local changes_made=false
+    local pr_table_file
+    pr_table_file=$(mktemp)
+    echo "| File | Action | Change |" > "$pr_table_file"
+    echo "|------|--------|--------|" >> "$pr_table_file"
 
-    echo "$workflows_content" | jq -c '.[]' | while read -r file_obj; do
+    local changes_made=false
+    local files_changed=0
+
+    while IFS= read -r file_obj; do
         local file_name
         file_name=$(echo "$file_obj" | jq -r '.name')
 
@@ -485,30 +514,142 @@ process_remote_repo() {
 
         # Download file content
         local content
-        if [[ "$USE_GH_CLI" == true ]]; then
-            content=$(curl -sS "$download_url")
-        else
-            content=$(curl -sS "$download_url")
-        fi
+        content=$(curl -sS "$download_url")
 
         # Save to temp file
         local temp_file
         temp_file=$(mktemp)
         echo "$content" > "$temp_file"
 
-        # Process file
-        local original_file
-        original_file=$(mktemp)
-        cp "$temp_file" "$original_file"
+        # Process file to pin actions
+        local processed_file
+        processed_file=$(mktemp)
+        local file_changed=false
 
-        # TODO: Process and track changes
-        # For now, we'll skip the actual processing in remote mode
-        # This would need to be implemented with change tracking
+        while IFS= read -r line; do
+            if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+                local indent
+                indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
 
-        rm "$temp_file" "$original_file"
-    done
+                local uses_part
+                uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+
+                # Skip local actions
+                if echo "$uses_part" | grep -qE '^\.\/'; then
+                    echo "$line" >> "$processed_file"
+                    continue
+                fi
+
+                # Parse owner/repo@ref
+                local action_with_ref
+                action_with_ref=$(echo "$uses_part" | awk '{print $1}')
+
+                if [[ ! "$action_with_ref" =~ @ ]]; then
+                    echo "$line" >> "$processed_file"
+                    continue
+                fi
+
+                local action_path="${action_with_ref%@*}"
+                local current_ref="${action_with_ref#*@}"
+
+                # Extract owner and repo
+                local owner
+                local repo_name
+                if [[ "$action_path" == */* ]]; then
+                    owner=$(echo "$action_path" | cut -d'/' -f1)
+                    repo_name=$(echo "$action_path" | cut -d'/' -f2)
+                else
+                    echo "$line" >> "$processed_file"
+                    continue
+                fi
+
+                # Check if already pinned
+                if is_pinned "$current_ref"; then
+                    if [[ "$UPGRADE_MODE" == false ]]; then
+                        echo "$line" >> "$processed_file"
+                        continue
+                    fi
+                fi
+
+                # Get latest version and pin it
+                local latest_tag
+                latest_tag=$(get_latest_version "$owner" "$repo_name" 2>/dev/null) || {
+                    echo "$line" >> "$processed_file"
+                    continue
+                }
+
+                local latest_sha
+                latest_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$latest_tag" 2>/dev/null) || {
+                    echo "$line" >> "$processed_file"
+                    continue
+                }
+
+                # Only change if different
+                if [[ "$current_ref" != "$latest_sha" ]]; then
+                    local new_line="${indent}uses: $action_path@$latest_sha # $latest_tag"
+                    echo "$new_line" >> "$processed_file"
+                    echo "| \`$file_name\` | \`$action_path\` | \`$current_ref\` → \`$latest_sha\` (\`$latest_tag\`) |" >> "$pr_table_file"
+                    file_changed=true
+                    echo "  [PIN] $action_path@$current_ref → $latest_sha # $latest_tag"
+                else
+                    echo "$line" >> "$processed_file"
+                fi
+            else
+                echo "$line" >> "$processed_file"
+            fi
+        done < "$temp_file"
+
+        # If file changed, commit it to the remote branch
+        if [[ "$file_changed" == true ]]; then
+            echo "[INFO] Committing changes to $file_path"
+
+            # Base64 encode the new content (remove line breaks for GitHub API)
+            local new_content
+            if command -v base64 &>/dev/null; then
+                # macOS base64 adds line breaks, remove them
+                new_content=$(base64 < "$processed_file" | tr -d '\n')
+            else
+                echo "[ERROR] base64 command not found"
+                exit 1
+            fi
+
+            # Update file on remote branch
+            local update_data
+            update_data=$(jq -n \
+                --arg message "Pin actions in $file_name" \
+                --arg content "$new_content" \
+                --arg sha "$file_sha" \
+                --arg branch "$BRANCH_NAME" \
+                '{message: $message, content: $content, sha: $sha, branch: $branch}')
+
+            gh_api_put "/repos/$repo/contents/$file_path" "$update_data" > /dev/null || {
+                echo "[ERROR] Failed to update $file_path"
+                rm "$temp_file" "$processed_file" "$pr_table_file"
+                exit 1
+            }
+
+            changes_made=true
+            ((files_changed++))
+        fi
+
+        rm "$temp_file" "$processed_file"
+    done < <(echo "$workflows_content" | jq -c '.[]')
+
+    if [[ "$changes_made" == false ]]; then
+        echo "[INFO] No changes needed - all actions are already pinned"
+        # Delete the branch we created
+        gh_api_delete "/repos/$repo/git/refs/heads/$BRANCH_NAME" 2>/dev/null || true
+        rm "$pr_table_file"
+        exit 0
+    fi
+
+    echo "[INFO] $files_changed file(s) updated"
 
     echo "[INFO] All files processed. Creating PR..."
+
+    # Read the changes table
+    local pr_table
+    pr_table=$(cat "$pr_table_file")
 
     # Create PR
     local pr_body
@@ -530,6 +671,9 @@ If this PR is closed without merging, the branch \`$BRANCH_NAME\` will need to b
 
 ---
 🤖 Generated by [PinnR](https://github.com/CyBirdSecurity/pinnr)"
+
+    # Clean up temp file
+    rm "$pr_table_file"
 
     local pr_data
     pr_data=$(jq -n \
