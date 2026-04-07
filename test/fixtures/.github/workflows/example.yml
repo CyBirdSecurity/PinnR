@@ -1,0 +1,48 @@
+name: Example Workflow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Case 1: Unpinned action with version tag
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Case 2: Unpinned action with branch reference
+      - name: Setup Node
+        uses: actions/setup-node@main
+
+      # Case 3: Already pinned SHA but now outdated (actions/cache v4.2.0)
+      - name: Cache dependencies (outdated)
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.2.0
+
+      # Case 4: Already pinned but to an older SHA (actions/upload-artifact v3.1.0)
+      - name: Upload artifact (outdated)
+        uses: actions/upload-artifact@83fd05a356d7e2593de66fc9913b3002723633cb # v3.1.0
+
+      # Case 5: Local action
+      - name: Run local action
+        uses: ./.github/actions/custom-action
+
+      # Case 6: Action with tags but no formal releases (docker/setup-buildx-action)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Additional test case: action with subpath
+      - name: Checkout with subpath
+        uses: actions/checkout@v4
+        with:
+          path: 'subdir'
+
+      # Test indentation handling
+      - name: Multi-line step
+        if: github.event_name == 'push'
+        uses: actions/setup-python@v5
