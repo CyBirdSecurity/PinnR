@@ -11,6 +11,7 @@ UPGRADE_MODE=false
 SCAN_MODE=false
 REMOTE_REPO=""
 BRANCH_NAME=""
+ALLOW_PRERELEASE=false
 USE_GH_CLI=false
 USE_CURL=false
 
@@ -182,6 +183,15 @@ resolve_ref_to_sha() {
     fi
 }
 
+is_prerelease_tag() {
+    local tag="$1"
+    # Check for common pre-release indicators
+    if echo "$tag" | grep -qiE '(alpha|beta|rc|pre|dev|preview|canary|snapshot|experimental)'; then
+        return 0  # Is a pre-release
+    fi
+    return 1  # Not a pre-release
+}
+
 get_latest_version() {
     local owner="$1"
     local repo="$2"
@@ -194,6 +204,22 @@ get_latest_version() {
             echo "[WARN] No releases or tags found for $owner/$repo" >&2
             return 1
         }
+
+        # Filter tags based on pre-release setting
+        if [[ "$ALLOW_PRERELEASE" == false ]]; then
+            # Find first non-prerelease tag
+            local tag
+            while IFS= read -r tag; do
+                if ! is_prerelease_tag "$tag"; then
+                    echo "$tag"
+                    return 0
+                fi
+            done < <(echo "$response" | jq -r '.[].name')
+
+            # If no stable tags found, warn and use first tag anyway
+            echo "[WARN] No stable releases found for $owner/$repo, using latest tag" >&2
+        fi
+
         echo "$response" | jq -r '.[0].name'
         return 0
     }
@@ -209,7 +235,8 @@ process_workflow_file() {
     temp_file=$(mktemp)
 
     if [[ "$SCAN_MODE" == true ]]; then
-        echo ":page_facing_up: $file_path"
+        echo ""
+        echo "📄 $file_path"
     fi
 
     local total_actions=0
@@ -229,7 +256,7 @@ process_workflow_file() {
             # Check for local action
             if echo "$uses_part" | grep -qE '^\.\/'; then
                 if [[ "$SCAN_MODE" == true ]]; then
-                    echo "  :black_right_pointing_double_triangle_with_vertical_bar:  $uses_part (local — skipped)"
+                    echo "  ⏩  $uses_part (local — skipped)"
                     ((skipped++))
                     ((total_actions++))
                 fi
@@ -291,7 +318,7 @@ process_workflow_file() {
                 if [[ "$is_currently_pinned" == true ]] && [[ "$current_ref" == "$latest_sha" ]]; then
                     # Already on latest SHA
                     if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  :white_check_mark: $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
+                        echo "  ✅ $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
                         ((up_to_date++))
                     else
                         echo "[SKIP] $action_path already on latest SHA ($latest_sha)"
@@ -300,7 +327,7 @@ process_workflow_file() {
                 elif [[ "$is_currently_pinned" == false ]]; then
                     # Unpinned - pin it
                     if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  :warning:  $action_path@$current_ref (unpinned — latest: $latest_tag → sha: ${latest_sha:0:7}...)"
+                        echo "  ⚠️  $action_path@$current_ref (unpinned — latest: $latest_tag → sha: ${latest_sha:0:7}...)"
                         ((unpinned++))
                     else
                         echo "[PIN] $action_path@$current_ref → $latest_sha # $latest_tag"
@@ -311,7 +338,7 @@ process_workflow_file() {
                 else
                     # Outdated SHA - upgrade
                     if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  :arrows_counterclockwise: $action_path@${current_ref:0:7}... # $existing_comment (newer available: $latest_tag → sha: ${latest_sha:0:7}...)"
+                        echo "  🔄 $action_path@${current_ref:0:7}... # $existing_comment (newer available: $latest_tag → sha: ${latest_sha:0:7}...)"
                         ((outdated++))
                     else
                         echo "[UPDATE] $action_path@$current_ref → $latest_sha # $latest_tag"
@@ -337,10 +364,10 @@ process_workflow_file() {
                     }
 
                     if [[ "$current_ref" == "$latest_sha" ]]; then
-                        echo "  :white_check_mark: $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
+                        echo "  ✅ $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
                         ((up_to_date++))
                     else
-                        echo "  :arrows_counterclockwise: $action_path@${current_ref:0:7}... # $existing_comment (newer available: $latest_tag → sha: ${latest_sha:0:7}...)"
+                        echo "  🔄 $action_path@${current_ref:0:7}... # $existing_comment (newer available: $latest_tag → sha: ${latest_sha:0:7}...)"
                         ((outdated++))
                     fi
                 fi
@@ -537,6 +564,7 @@ FLAGS:
     -t              Dry-run mode: show proposed changes without writing files
     -U              Upgrade mode: update all actions to latest versions
     -S              Scan mode: report status of all actions, exit 1 if any unpinned/outdated
+    -P              Allow pre-release tags (alpha, beta, rc, etc.). Default: exclude pre-releases
     -R <repo>       Remote mode: process owner/repo and create PR
     -b <branch>     Custom branch name for -R (default: pinnR/GHA-Update-YYYY-MM-DD)
     -h              Show this help message
@@ -559,11 +587,12 @@ main() {
     # Parse flags
     local target_path="."
 
-    while getopts "tUSR:b:h" opt; do
+    while getopts "tUSPR:b:h" opt; do
         case $opt in
             t) DRY_RUN=true ;;
             U) UPGRADE_MODE=true ;;
             S) SCAN_MODE=true ;;
+            P) ALLOW_PRERELEASE=true ;;
             R) REMOTE_REPO="$OPTARG" ;;
             b) BRANCH_NAME="$OPTARG" ;;
             h) print_usage; exit 0 ;;

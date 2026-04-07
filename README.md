@@ -95,6 +95,7 @@ pinnr [FLAGS] [PATH]
 | `-t`          | **Dry-run mode**: Show proposed changes as a diff without modifying files               |
 | `-U`          | **Upgrade mode**: Update all actions to their latest versions (even if already pinned)  |
 | `-S`          | **Scan mode**: Report status of all actions. Exit 1 if any are unpinned or outdated     |
+| `-P`          | **Allow pre-releases**: Include pre-release tags (alpha, beta, rc). Default: stable only |
 | `-R <repo>`   | **Remote mode**: Process `owner/repo` and create a PR (never commits to default branch) |
 | `-b <branch>` | Specify custom branch name for `-R` (default: `pinnR/GHA-Update-YYYY-MM-DD`)            |
 | `-h`          | Show help message                                                                       |
@@ -106,10 +107,12 @@ All of the following are valid:
 
 - `-t` (dry-run) works with any combination
 - `-S` (scan) works with any combination
+- `-P` (allow pre-releases) works with any combination
 - `-R -U` (remote upgrade)
 - `-R -b custom-branch` (custom branch name)
 - `-t -U` (dry-run upgrade)
 - `-S -U` (scan with upgrade check)
+- `-U -P` (upgrade including pre-release versions)
 
 ---
 
@@ -147,6 +150,20 @@ Output:
 pinnr -U
 ```
 
+### Include pre-release versions
+
+By default, PinnR excludes pre-release tags (alpha, beta, rc, etc.) and only uses stable releases. Use `-P` to include pre-releases:
+
+```bash
+# Without -P: uses stable v1 tag
+pinnr -t
+
+# With -P: allows v2-beta tag
+pinnr -t -P
+```
+
+This is useful when you specifically want to test bleeding-edge versions or when a project only publishes pre-release tags.
+
 ### Scan and report status
 
 ```bash
@@ -156,11 +173,11 @@ pinnr -S
 Output:
 
 ```
-:page_facing_up: .github/workflows/ci.yml
-  :white_check_mark: actions/checkout@a81bbbf... # v4.1.0 (up to date)
-  :warning:  actions/setup-node@main (unpinned — latest: v4.1.2 → sha: 1e60f62...)
-  :arrows_counterclockwise: actions/cache@abc0000... # v3.0.0 (newer available: v3.3.2 → sha: fed9876...)
-  :black_right_pointing_double_triangle_with_vertical_bar:  ./.github/actions/local-action (local — skipped)
+📄 .github/workflows/ci.yml
+  ✅ actions/checkout@a81bbbf... # v4.1.0 (up to date)
+  ⚠️  actions/setup-node@main (unpinned — latest: v4.1.2 → sha: 1e60f62...)
+  🔄 actions/cache@abc0000... # v3.0.0 (newer available: v3.3.2 → sha: fed9876...)
+  ⏩  ./.github/actions/local-action (local — skipped)
 
 Summary: 4 actions found | 1 up to date | 1 unpinned | 1 outdated | 1 skipped
 ```
@@ -290,6 +307,18 @@ If you hit the limit, PinnR will display the reset time and exit. Authenticate w
 ### Local Actions
 
 PinnR automatically skips local actions (e.g., `uses: ./.github/actions/something`). They cannot be pinned because they're local files, not remote repositories.
+
+### Pre-Release Tags
+
+By default, PinnR excludes pre-release versions to ensure stability. It filters out tags containing:
+
+- `alpha`, `beta`, `rc` (release candidate)
+- `pre`, `dev`, `preview`
+- `canary`, `snapshot`, `experimental`
+
+**Example**: If a repo has tags `v2-beta` (May 2024) and `v1` (Jan 2025), PinnR will choose `v1` because it's the latest **stable** release.
+
+Use the `-P` flag to include pre-release tags when you need bleeding-edge versions or when a project only publishes pre-releases.
 
 ### Undoing Changes
 

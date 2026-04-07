@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pre-release filtering**: By default, PinnR now excludes pre-release tags (alpha, beta, rc, dev, preview, canary, snapshot, experimental) and only uses stable releases
+- `-P` flag: Allow pre-release tags when you specifically need bleeding-edge versions
+
+### Changed
+
+- Version detection now prefers stable releases over pre-releases by default, improving security and stability
+
 ## [1.0.0] - 2026-04-07
 
 ### Added
