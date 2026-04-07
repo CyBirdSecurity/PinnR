@@ -32,10 +32,11 @@ PinnR automatically resolves tags and branches to their exact commit SHAs and ad
 ## How It Works
 
 1. **Scans** your `.github/workflows/` directory for action references
-2. **Resolves** floating tags and branches to their specific commit SHAs via GitHub API
-3. **Pins** actions by replacing references with SHAs
+2. **Resolves** tags and branches to their specific commit SHAs via GitHub API
+3. **Pins** actions by replacing references with SHAs (pinning to current version by default)
 4. **Preserves** version information in inline comments (`# v4.1.0`)
-5. **Optionally** creates a pull request for remote repositories
+5. **Optionally upgrades** to latest versions when using `-U` flag
+6. **Optionally** creates a pull request for remote repositories
 
 ---
 
@@ -90,15 +91,15 @@ pinnr [FLAGS] [PATH]
 ### Flags
 
 
-| Flag          | Description                                                                             |
-| ------------- | --------------------------------------------------------------------------------------- |
-| `-t`          | **Dry-run mode**: Show proposed changes as a diff without modifying files               |
-| `-U`          | **Upgrade mode**: Update all actions to their latest versions (even if already pinned)  |
-| `-S`          | **Scan mode**: Report status of all actions. Exit 1 if any are unpinned or outdated     |
-| `-P`          | **Allow pre-releases**: Include pre-release tags (alpha, beta, rc). Default: stable only |
-| `-R <repo>`   | **Remote mode**: Process `owner/repo` and create a PR (never commits to default branch) |
-| `-b <branch>` | Specify custom branch name for `-R` (default: `pinnR/GHA-Update-YYYY-MM-DD`)            |
-| `-h`          | Show help message                                                                       |
+| Flag          | Description                                                                                      |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `-t`          | **Dry-run mode**: Show proposed changes as a diff without modifying files                        |
+| `-U`          | **Upgrade mode**: Upgrade all actions to their latest versions (default: pin to current version) |
+| `-S`          | **Scan mode**: Report status of all actions. Exit 1 if any are unpinned or outdated              |
+| `-P`          | **Allow pre-releases**: Include pre-release tags (alpha, beta, rc). Default: stable only         |
+| `-R <repo>`   | **Remote mode**: Process `owner/repo` and create a PR (never commits to default branch)          |
+| `-b <branch>` | Specify custom branch name for `-R` (default: `pinnR/GHA-Update-YYYY-MM-DD`)                     |
+| `-h`          | Show help message                                                                                |
 
 
 ### Flag Combinations
@@ -118,12 +119,16 @@ All of the following are valid:
 
 ## Examples
 
-### Pin unpinned actions locally
+### Pin actions to their current version
+
+By default, PinnR pins actions to the commit SHA of their current tag/ref without upgrading:
 
 ```bash
 cd /path/to/your/repo
 pinnr
 ```
+
+If your workflow has `actions/checkout@v4`, it will pin to whatever commit `v4` currently points to, not upgrade to `v5`.
 
 ### Dry-run to see what would change
 
@@ -141,14 +146,18 @@ Output:
      steps:
        - name: Checkout
 -        uses: actions/checkout@v4
-+        uses: actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675 # v4.1.0
++        uses: actions/checkout@a81bbbf8298c0fa03ea29cdc473d45769f953675 # v4
 ```
 
 ### Upgrade all actions to latest versions
 
+Use the `-U` flag to upgrade unpinned actions to the latest available version and update already-pinned actions:
+
 ```bash
 pinnr -U
 ```
+
+This will change `actions/checkout@v4` to the latest version (e.g., `v5`) if available.
 
 ### Include pre-release versions
 
@@ -350,9 +359,15 @@ gh auth refresh -s repo
 
 If an action has no releases or tags, PinnR will print a warning and skip it. This is rare but can happen with experimental or archived repositories.
 
-### Already Pinned Actions
+### Default Behavior vs Upgrade Mode
 
-By default, PinnR skips actions that are already pinned to a SHA. To update them to the latest version, use `-U`.
+**Default (no `-U` flag)**:
+- Unpinned actions are pinned to their current tag/ref (e.g., `v4` → SHA of `v4`)
+- Already pinned actions are left unchanged
+
+**With `-U` flag**:
+- Unpinned actions are upgraded to the latest version
+- Already pinned actions are upgraded to the latest version
 
 ---
 

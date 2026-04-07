@@ -325,54 +325,8 @@ process_workflow_file() {
                 existing_comment=$(echo "$line" | sed -n 's/.*#[[:space:]]*//p')
             fi
 
-            if [[ "$UPGRADE_MODE" == true ]] || [[ "$is_currently_pinned" == false ]]; then
-                # Resolve latest version
-                local latest_tag
-                latest_tag=$(get_latest_version "$owner" "$repo") || {
-                    echo "$line" >> "$temp_file"
-                    continue
-                }
-
-                local latest_sha
-                latest_sha=$(resolve_ref_to_sha "$owner" "$repo" "$latest_tag") || {
-                    echo "$line" >> "$temp_file"
-                    continue
-                }
-
-                if [[ "$is_currently_pinned" == true ]] && [[ "$current_ref" == "$latest_sha" ]]; then
-                    # Already on latest SHA
-                    if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  ✅ $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
-                        ((up_to_date++))
-                    else
-                        echo "[SKIP] $action_path already on latest SHA ($latest_sha)"
-                    fi
-                    echo "$line" >> "$temp_file"
-                elif [[ "$is_currently_pinned" == false ]]; then
-                    # Unpinned - pin it
-                    if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  ⚠️  $action_path@$current_ref (unpinned — latest: $latest_tag → sha: ${latest_sha:0:7}...)"
-                        ((unpinned++))
-                    else
-                        echo "[PIN] $action_path@$current_ref → $latest_sha # $latest_tag"
-                    fi
-                    local new_line="${indent}uses: $action_path@$latest_sha # $latest_tag"
-                    echo "$new_line" >> "$temp_file"
-                    changed=true
-                else
-                    # Outdated SHA - upgrade
-                    if [[ "$SCAN_MODE" == true ]]; then
-                        echo "  🔄 $action_path@${current_ref:0:7}... # $existing_comment (newer available: $latest_tag → sha: ${latest_sha:0:7}...)"
-                        ((outdated++))
-                    else
-                        echo "[UPDATE] $action_path@$current_ref → $latest_sha # $latest_tag"
-                    fi
-                    local new_line="${indent}uses: $action_path@$latest_sha # $latest_tag"
-                    echo "$new_line" >> "$temp_file"
-                    changed=true
-                fi
-            else
-                # Not upgrade mode and already pinned - keep as is
+            # If already pinned and not upgrading, skip or scan
+            if [[ "$is_currently_pinned" == true ]] && [[ "$UPGRADE_MODE" == false ]]; then
                 if [[ "$SCAN_MODE" == true ]]; then
                     # Check if it's the latest
                     local latest_tag
@@ -396,6 +350,58 @@ process_workflow_file() {
                     fi
                 fi
                 echo "$line" >> "$temp_file"
+            elif [[ "$UPGRADE_MODE" == true ]]; then
+                # Upgrade mode - always get latest version
+                local latest_tag
+                latest_tag=$(get_latest_version "$owner" "$repo") || {
+                    echo "$line" >> "$temp_file"
+                    continue
+                }
+
+                local latest_sha
+                latest_sha=$(resolve_ref_to_sha "$owner" "$repo" "$latest_tag") || {
+                    echo "$line" >> "$temp_file"
+                    continue
+                }
+
+                if [[ "$current_ref" == "$latest_sha" ]]; then
+                    # Already on latest SHA
+                    if [[ "$SCAN_MODE" == true ]]; then
+                        echo "  ✅ $action_path@${current_ref:0:7}... # $existing_comment (up to date)"
+                        ((up_to_date++))
+                    else
+                        echo "[SKIP] $action_path already on latest SHA ($latest_sha)"
+                    fi
+                    echo "$line" >> "$temp_file"
+                else
+                    # Upgrade to latest
+                    if [[ "$SCAN_MODE" == true ]]; then
+                        echo "  🔄 $action_path@${current_ref:0:7}... # $existing_comment (upgrading to: $latest_tag → sha: ${latest_sha:0:7}...)"
+                        ((outdated++))
+                    else
+                        echo "[UPDATE] $action_path@$current_ref → $latest_sha # $latest_tag"
+                    fi
+                    local new_line="${indent}uses: $action_path@$latest_sha # $latest_tag"
+                    echo "$new_line" >> "$temp_file"
+                    changed=true
+                fi
+            else
+                # Default mode - pin to current ref's SHA
+                local target_sha
+                target_sha=$(resolve_ref_to_sha "$owner" "$repo" "$current_ref") || {
+                    echo "$line" >> "$temp_file"
+                    continue
+                }
+
+                if [[ "$SCAN_MODE" == true ]]; then
+                    echo "  ⚠️  $action_path@$current_ref (unpinned — will pin to: $current_ref → sha: ${target_sha:0:7}...)"
+                    ((unpinned++))
+                else
+                    echo "[PIN] $action_path@$current_ref → $target_sha # $current_ref"
+                fi
+                local new_line="${indent}uses: $action_path@$target_sha # $current_ref"
+                echo "$new_line" >> "$temp_file"
+                changed=true
             fi
         else
             echo "$line" >> "$temp_file"
@@ -571,26 +577,37 @@ process_remote_repo() {
                     fi
                 fi
 
-                # Get latest version and pin it
-                local latest_tag
-                latest_tag=$(get_latest_version "$owner" "$repo_name" 2>/dev/null) || {
-                    echo "$line" >> "$processed_file"
-                    continue
-                }
+                # Determine target version and SHA
+                local target_tag
+                local target_sha
 
-                local latest_sha
-                latest_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$latest_tag" 2>/dev/null) || {
-                    echo "$line" >> "$processed_file"
-                    continue
-                }
+                if [[ "$UPGRADE_MODE" == true ]]; then
+                    # Upgrade mode - get latest version
+                    target_tag=$(get_latest_version "$owner" "$repo_name" 2>/dev/null) || {
+                        echo "$line" >> "$processed_file"
+                        continue
+                    }
+
+                    target_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$target_tag" 2>/dev/null) || {
+                        echo "$line" >> "$processed_file"
+                        continue
+                    }
+                else
+                    # Default mode - pin to current ref
+                    target_tag="$current_ref"
+                    target_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$current_ref" 2>/dev/null) || {
+                        echo "$line" >> "$processed_file"
+                        continue
+                    }
+                fi
 
                 # Only change if different
-                if [[ "$current_ref" != "$latest_sha" ]]; then
-                    local new_line="${indent}uses: $action_path@$latest_sha # $latest_tag"
+                if [[ "$current_ref" != "$target_sha" ]]; then
+                    local new_line="${indent}uses: $action_path@$target_sha # $target_tag"
                     echo "$new_line" >> "$processed_file"
-                    echo "| \`$file_name\` | \`$action_path\` | \`$current_ref\` → \`$latest_sha\` (\`$latest_tag\`) |" >> "$pr_table_file"
+                    echo "| \`$file_name\` | \`$action_path\` | \`$current_ref\` → \`$target_sha\` (\`$target_tag\`) |" >> "$pr_table_file"
                     file_changed=true
-                    echo "  [PIN] $action_path@$current_ref → $latest_sha # $latest_tag"
+                    echo "  [PIN] $action_path@$current_ref → $target_sha # $target_tag"
                 else
                     echo "$line" >> "$processed_file"
                 fi
