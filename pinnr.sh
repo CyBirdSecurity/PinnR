@@ -14,6 +14,19 @@ BRANCH_NAME=""
 ALLOW_PRERELEASE=false
 USE_GH_CLI=false
 USE_CURL=false
+AUDIT_MODE=false
+UNPINNED_ONLY_MODE=false
+
+# Audit statistics (using individual variables for bash 3.x compatibility)
+AUDIT_TOTAL_REPOS=0
+AUDIT_REPOS_SCANNED=0
+AUDIT_REPOS_WITH_WORKFLOWS=0
+AUDIT_REPOS_WITHOUT_WORKFLOWS=0
+AUDIT_REPOS_WITH_UNPINNED=0
+AUDIT_TOTAL_ACTIONS=0
+AUDIT_TOTAL_PINNED=0
+AUDIT_TOTAL_UNPINNED=0
+AUDIT_TOTAL_LOCAL=0
 
 # === DEPENDENCY CHECKS ===
 check_dependencies() {
@@ -249,6 +262,354 @@ get_latest_version() {
     }
 
     echo "$response" | jq -r '.tag_name'
+}
+
+# === ORGANIZATION AUDIT FUNCTIONS ===
+
+# Paginate GitHub API calls to handle >100 items
+paginate_api_call() {
+    local endpoint="$1"
+    local page=1
+    local all_results="[]"
+
+    while true; do
+        local response
+        response=$(gh_api_get "${endpoint}?page=${page}&per_page=100" 2>&1) || {
+            echo "[ERROR] Failed to fetch page $page from $endpoint" >&2
+            return 1
+        }
+
+        local count
+        count=$(echo "$response" | jq 'length')
+
+        if [[ $count -eq 0 ]]; then
+            break
+        fi
+
+        all_results=$(echo "$all_results" "$response" | jq -s 'add')
+        ((page++))
+    done
+
+    echo "$all_results"
+}
+
+# Fetch all non-archived repos from organization
+fetch_org_repos() {
+    local org="$1"
+
+    echo "[INFO] Fetching repositories from organization: $org" >&2
+
+    local repos
+    repos=$(paginate_api_call "/orgs/$org/repos" 2>&1) || {
+        echo "[ERROR] Failed to fetch repositories for organization: $org" >&2
+        echo "[ERROR] Please verify the organization name and your access permissions" >&2
+        return 1
+    }
+
+    # Filter out archived repos
+    local active_repos
+    active_repos=$(echo "$repos" | jq -c '[.[] | select(.archived == false)]')
+
+    echo "$active_repos"
+}
+
+# Initialize CSV file with headers
+init_csv_file() {
+    local csv_file="$1"
+
+    echo "Repository,Workflow File,Action,Current Ref,Is Pinned" > "$csv_file"
+}
+
+# Append a row to the CSV file
+append_csv_row() {
+    local csv_file="$1"
+    local repo="$2"
+    local workflow="$3"
+    local action="$4"
+    local ref="$5"
+    local is_pinned="$6"  # "yes" or "no"
+
+    # Escape double quotes for CSV
+    repo="${repo//\"/\"\"}"
+    workflow="${workflow//\"/\"\"}"
+    action="${action//\"/\"\"}"
+    ref="${ref//\"/\"\"}"
+
+    # Truncate SHAs for readability (but keep original for CSV data)
+    local display_ref="$ref"
+    if [[ ${#ref} -eq 40 ]] && is_pinned "$ref"; then
+        display_ref="${ref:0:12}..."
+    fi
+
+    echo "\"$repo\",\"$workflow\",\"$action\",\"$display_ref\",\"$is_pinned\"" >> "$csv_file"
+}
+
+# Extract actions from a workflow file and write to CSV
+extract_actions_from_workflow() {
+    local csv_file="$1"
+    local repo_name="$2"
+    local workflow_name="$3"
+    local workflow_content="$4"
+
+    # Create temp file for workflow content
+    local temp_workflow
+    temp_workflow=$(mktemp)
+    echo "$workflow_content" > "$temp_workflow"
+
+    while IFS= read -r line; do
+        if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+            local uses_part
+            uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+
+            # Skip local actions
+            if echo "$uses_part" | grep -qE '^\.\/'; then
+                ((AUDIT_TOTAL_LOCAL++)) || true
+                continue
+            fi
+
+            # Parse owner/repo@ref
+            local action_with_ref
+            action_with_ref=$(echo "$uses_part" | awk '{print $1}')
+
+            if [[ ! "$action_with_ref" =~ @ ]]; then
+                continue
+            fi
+
+            local action_path="${action_with_ref%@*}"
+            local current_ref="${action_with_ref#*@}"
+
+            # Validate action format (owner/repo)
+            if [[ ! "$action_path" == */* ]]; then
+                continue
+            fi
+
+            ((AUDIT_TOTAL_ACTIONS++)) || true
+
+            # Check if pinned
+            local pinned_status="no"
+            if is_pinned "$current_ref"; then
+                pinned_status="yes"
+                ((AUDIT_TOTAL_PINNED++)) || true
+            else
+                ((AUDIT_TOTAL_UNPINNED++)) || true
+            fi
+
+            # Conditionally write to CSV based on mode
+            if [[ "$UNPINNED_ONLY_MODE" == true ]] && [[ "$pinned_status" == "yes" ]]; then
+                continue  # Skip pinned actions in unpinned-only mode
+            fi
+
+            append_csv_row "$csv_file" "$repo_name" "$workflow_name" "$action_path" "$current_ref" "$pinned_status"
+        fi
+    done < "$temp_workflow"
+
+    rm -f "$temp_workflow"
+}
+
+# Audit a single repository
+audit_single_repo() {
+    local csv_file="$1"
+    local repo_name="$2"
+
+    [[ "${PINNR_DEBUG:-}" == "1" ]] && echo "[DEBUG] Processing repo: $repo_name" >&2
+
+    # Fetch workflow files
+    local workflows_content
+    workflows_content=$(gh_api_get "/repos/$repo_name/contents/.github/workflows" 2>&1) || {
+        local api_error=$?
+        [[ "${PINNR_DEBUG:-}" == "1" ]] && echo "[DEBUG] API call failed for $repo_name with exit code $api_error" >&2
+
+        # 404 means no workflows directory - skip silently
+        if echo "$workflows_content" | grep -qi "404\|not found"; then
+            ((AUDIT_REPOS_WITHOUT_WORKFLOWS++)) || true
+            return 0
+        fi
+
+        # Other errors - skip silently
+        ((AUDIT_REPOS_WITHOUT_WORKFLOWS++)) || true
+        return 0
+    }
+
+    [[ "${PINNR_DEBUG:-}" == "1" ]] && echo "[DEBUG] Successfully fetched workflows for $repo_name" >&2
+
+    # Check if directory is empty or if response is not valid JSON
+    local file_count
+    file_count=$(echo "$workflows_content" | jq 'length' 2>/dev/null) || {
+        [[ "${PINNR_DEBUG:-}" == "1" ]] && echo "[DEBUG] Invalid JSON response for $repo_name" >&2
+        ((AUDIT_REPOS_WITHOUT_WORKFLOWS++)) || true
+        return 0
+    }
+
+    if [[ $file_count -eq 0 ]]; then
+        ((AUDIT_REPOS_WITHOUT_WORKFLOWS++)) || true
+        return 0
+    fi
+
+    ((AUDIT_REPOS_WITH_WORKFLOWS++)) || true
+
+    local has_unpinned=false
+
+    # Process each workflow file
+    while IFS= read -r file_obj; do
+        local file_name
+        file_name=$(echo "$file_obj" | jq -r '.name')
+
+        # Only process YAML files
+        if [[ ! "$file_name" =~ \.ya?ml$ ]]; then
+            continue
+        fi
+
+        local download_url
+        download_url=$(echo "$file_obj" | jq -r '.download_url')
+
+        # Download workflow content (uses download URL, no auth required, doesn't count against rate limit)
+        local content
+        content=$(curl -sS --max-time 10 "$download_url" 2>&1) || {
+            echo "[WARN] Failed to download workflow $file_name from $repo_name" >&2
+            continue
+        }
+
+        # Track unpinned actions count before processing
+        local unpinned_before=$AUDIT_TOTAL_UNPINNED
+
+        # Extract and record actions
+        extract_actions_from_workflow "$csv_file" "$repo_name" ".github/workflows/$file_name" "$content"
+
+        # Check if unpinned actions were found
+        if [[ $AUDIT_TOTAL_UNPINNED -gt $unpinned_before ]]; then
+            has_unpinned=true
+        fi
+    done < <(echo "$workflows_content" | jq -c '.[]')
+
+    if [[ "$has_unpinned" == true ]]; then
+        ((AUDIT_REPOS_WITH_UNPINNED++)) || true
+    fi
+}
+
+# Show progress indicator
+show_progress() {
+    local current="$1"
+    local total="$2"
+    local repo_name="$3"
+
+    local percent=$((current * 100 / total))
+
+    # Check if stderr is a terminal (interactive)
+    if [[ -t 2 ]]; then
+        # Interactive terminal - use progress bar with carriage return
+        local filled=$((percent / 5))
+
+        # Build progress bar
+        local bar=""
+        for ((i=1; i<=filled; i++)); do
+            bar+="█"
+        done
+        for ((i=filled+1; i<=20; i++)); do
+            bar+="░"
+        done
+
+        # Truncate repo name if too long
+        if [[ ${#repo_name} -gt 40 ]]; then
+            repo_name="${repo_name:0:37}..."
+        fi
+
+        printf "\r[%s] %3d%% (%d/%d) %s" "$bar" "$percent" "$current" "$total" "$repo_name" >&2
+
+        # Print newline when complete
+        [[ $current -eq $total ]] && echo "" >&2
+    else
+        # Non-interactive (redirected/piped) - show periodic updates
+        # Show at: start, every 50 repos, and end
+        if [[ $current -eq 1 ]] || [[ $current -eq $total ]] || [[ $((current % 50)) -eq 0 ]]; then
+            echo "[INFO] Progress: $percent% ($current/$total repos scanned)" >&2
+        fi
+    fi
+}
+
+# Print audit summary to terminal
+print_audit_summary() {
+    local org="$1"
+    local csv_file="$2"
+
+    echo "" >&2
+    echo "=== PinnR Audit Summary ===" >&2
+    echo "" >&2
+    echo "Organization: $org" >&2
+    echo "Date: $(date '+%Y-%m-%d %H:%M:%S')" >&2
+    echo "" >&2
+    echo "Repositories:" >&2
+    echo "  Total scanned:              $AUDIT_REPOS_SCANNED" >&2
+    echo "  With workflows:             $AUDIT_REPOS_WITH_WORKFLOWS" >&2
+    echo "  Without workflows:          $AUDIT_REPOS_WITHOUT_WORKFLOWS" >&2
+    echo "  With unpinned actions:      $AUDIT_REPOS_WITH_UNPINNED" >&2
+    echo "" >&2
+    echo "Actions:" >&2
+    echo "  Total found:                $AUDIT_TOTAL_ACTIONS" >&2
+
+    if [[ $AUDIT_TOTAL_ACTIONS -gt 0 ]]; then
+        local pinned_percent=$((AUDIT_TOTAL_PINNED * 100 / AUDIT_TOTAL_ACTIONS))
+        local unpinned_percent=$((AUDIT_TOTAL_UNPINNED * 100 / AUDIT_TOTAL_ACTIONS))
+        echo "  Pinned to SHA:              $AUDIT_TOTAL_PINNED (${pinned_percent}%)" >&2
+        echo "  Unpinned (tags/branches):   $AUDIT_TOTAL_UNPINNED (${unpinned_percent}%)" >&2
+    fi
+
+    echo "  Local (skipped):            $AUDIT_TOTAL_LOCAL" >&2
+    echo "" >&2
+    echo "Report saved to: $csv_file" >&2
+    echo "" >&2
+    echo "[SUCCESS] Audit complete" >&2
+}
+
+# Main audit orchestrator
+audit_organization() {
+    local org="$1"
+
+    echo "[INFO] Starting audit of organization: $org" >&2
+    echo "[INFO] Fetching repositories... (excluding archived)" >&2
+
+    # Fetch all repos
+    local repos
+    repos=$(fetch_org_repos "$org") || {
+        exit 1
+    }
+
+    # Count repos
+    local repo_count
+    repo_count=$(echo "$repos" | jq 'length')
+
+    if [[ $repo_count -eq 0 ]]; then
+        echo "[WARN] No repositories found in organization: $org" >&2
+        echo "[WARN] This could mean the organization is empty or you don't have access" >&2
+        exit 0
+    fi
+
+    echo "[INFO] Found $repo_count repositories to scan" >&2
+    echo "" >&2
+
+    # Generate CSV filename
+    local csv_filename="pinnr-audit-${org}-$(date '+%Y-%m-%d').csv"
+
+    # Initialize CSV file
+    init_csv_file "$csv_filename"
+
+    # Process each repository
+    local current=0
+    local repos_array
+    repos_array=$(echo "$repos" | jq -r '.[].full_name')
+
+    while IFS= read -r repo_full_name; do
+        [[ -z "$repo_full_name" ]] && continue
+
+        ((current++)) || true
+        ((AUDIT_REPOS_SCANNED++)) || true
+
+        show_progress "$current" "$repo_count" "$repo_full_name" || true
+
+        audit_single_repo "$csv_filename" "$repo_full_name" || true
+    done <<< "$repos_array"
+
+    # Print summary
+    print_audit_summary "$org" "$csv_filename"
 }
 
 # === FILE PROCESSING ===
@@ -728,6 +1089,8 @@ FLAGS:
     -P              Allow pre-release tags (alpha, beta, rc, etc.). Default: exclude pre-releases
     -R <repo>       Remote mode: process owner/repo and create PR
     -b <branch>     Custom branch name for -R (default: pinnR/GHA-Update-YYYY-MM-DD)
+    -A <org>        Audit organization: scan all repos for unpinned actions, generate CSV
+    -O              Unpinned-only mode: CSV includes only unpinned actions (use with -A)
     -h              Show this help message
 
 EXAMPLES:
@@ -737,6 +1100,8 @@ EXAMPLES:
     pinnr.sh -S                       # Scan and report status
     pinnr.sh -R owner/repo            # Process remote repo and create PR
     pinnr.sh -R owner/repo -b custom  # Use custom branch name
+    pinnr.sh -A myorg                 # Audit all repos in organization (full report)
+    pinnr.sh -A myorg -O              # Audit organization (unpinned actions only)
 
 AUTHENTICATION:
     Use 'gh auth login' (recommended) or set GITHUB_TOKEN environment variable.
@@ -747,8 +1112,10 @@ EOF
 main() {
     # Parse flags
     local target_path="."
+    local audit_org=""
+    local unpinned_only=false
 
-    while getopts "tUSPR:b:h" opt; do
+    while getopts "tUSPR:b:A:Oh" opt; do
         case $opt in
             t) DRY_RUN=true ;;
             U) UPGRADE_MODE=true ;;
@@ -756,6 +1123,8 @@ main() {
             P) ALLOW_PRERELEASE=true ;;
             R) REMOTE_REPO="$OPTARG" ;;
             b) BRANCH_NAME="$OPTARG" ;;
+            A) audit_org="$OPTARG" ;;
+            O) unpinned_only=true ;;
             h) print_usage; exit 0 ;;
             *) print_usage; exit 1 ;;
         esac
@@ -769,6 +1138,28 @@ main() {
 
     # Check dependencies
     check_dependencies
+
+    # Audit mode
+    if [[ -n "$audit_org" ]]; then
+        # Validate incompatible flags
+        if [[ -n "$REMOTE_REPO" ]]; then
+            echo "[ERROR] -A and -R cannot be used together"
+            exit 1
+        fi
+
+        if [[ "$UPGRADE_MODE" == true ]]; then
+            echo "[ERROR] -A and -U cannot be used together (audit is read-only)"
+            exit 1
+        fi
+
+        # Set global mode flags
+        AUDIT_MODE=true
+        UNPINNED_ONLY_MODE=$unpinned_only
+
+        # Run audit
+        audit_organization "$audit_org"
+        exit $?
+    fi
 
     # Remote mode
     if [[ -n "$REMOTE_REPO" ]]; then

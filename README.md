@@ -99,6 +99,8 @@ pinnr [FLAGS] [PATH]
 | `-P`          | **Allow pre-releases**: Include pre-release tags (alpha, beta, rc). Default: stable only         |
 | `-R <repo>`   | **Remote mode**: Process `owner/repo` and create a PR (never commits to default branch)          |
 | `-b <branch>` | Specify custom branch name for `-R` (default: `pinnR/GHA-Update-YYYY-MM-DD`)                     |
+| `-A <org>`    | **Audit organization**: Scan all repos in organization for unpinned actions, generate CSV report |
+| `-O`          | **Unpinned-only mode**: CSV includes only unpinned actions (must be used with `-A`)              |
 | `-h`          | Show help message                                                                                |
 
 
@@ -216,6 +218,110 @@ pinnr -R owner/repo -b security/pin-actions-2024-03
 
 ---
 
+## Organization-Wide Audits
+
+Scan all repositories in a GitHub organization to identify unpinned GitHub Actions across your entire organization. This is essential for security teams performing supply chain risk assessments.
+
+### Security Audit (Unpinned Only)
+
+Generate a CSV report containing only unpinned actions for security review:
+
+```bash
+pinnr -A myorg -O
+```
+
+This mode filters out already-pinned actions, showing only the actions that need attention.
+
+### Comprehensive Audit (All Actions)
+
+Generate a complete inventory of all GitHub Actions used across the organization:
+
+```bash
+pinnr -A myorg
+```
+
+This includes both pinned and unpinned actions for full visibility.
+
+### Output
+
+The audit displays a real-time progress indicator and summary statistics in the terminal:
+
+```
+[INFO] Starting audit of organization: acme-corp
+[INFO] Fetching repositories... (excluding archived)
+[INFO] Found 47 repositories to scan
+
+[████████████████████] 100% (47/47) acme-corp/api-service
+
+=== PinnR Audit Summary ===
+
+Organization: acme-corp
+Date: 2026-04-07 15:32:11
+
+Repositories:
+  Total scanned:              47
+  With workflows:             34
+  Without workflows:          13
+  With unpinned actions:      12
+
+Actions:
+  Total found:                234
+  Pinned to SHA:              189 (80%)
+  Unpinned (tags/branches):   45 (19%)
+  Local (skipped):            8
+
+Report saved to: pinnr-audit-acme-corp-2026-04-07.csv
+
+[SUCCESS] Audit complete
+```
+
+### CSV Format
+
+The CSV report is automatically saved with the filename pattern: `pinnr-audit-{org}-{date}.csv`
+
+**Columns:**
+- `Repository` - Full repository name (owner/repo)
+- `Workflow File` - Path to the workflow file
+- `Action` - The action being used (e.g., actions/checkout)
+- `Current Ref` - The current reference (tag, branch, or SHA)
+- `Is Pinned` - "yes" if pinned to SHA, "no" otherwise
+
+**Example CSV:**
+
+```csv
+Repository,Workflow File,Action,Current Ref,Is Pinned
+"acme-corp/api",".github/workflows/ci.yml","actions/checkout","v4","no"
+"acme-corp/web",".github/workflows/ci.yml","actions/setup-node","a81bbf8298c0...","yes"
+"acme-corp/backend",".github/workflows/test.yml","actions/cache","v3.2.0","no"
+```
+
+### Use Cases
+
+**Security Compliance:**
+```bash
+# Generate unpinned actions report for security review
+pinnr -A myorg -O
+
+# Share CSV with security team for risk assessment
+```
+
+**Inventory Management:**
+```bash
+# Generate complete action inventory
+pinnr -A myorg
+
+# Use CSV to track action versions across organization
+```
+
+**Notes:**
+- Archived repositories are automatically excluded
+- Repositories without workflows are silently skipped
+- Local actions (starting with `./`) are counted but not included in the report
+- The `-O` flag cannot be used without `-A`
+- Audit mode is read-only and never modifies repositories
+
+---
+
 ## Authentication
 
 ### Option 1: GitHub CLI (Recommended)
@@ -237,14 +343,15 @@ export GITHUB_TOKEN='your_token_here'
 #### Required Token Scopes
 
 
-| Operation                 | Required Scope                                         |
-| ------------------------- | ------------------------------------------------------ |
-| Read public repositories  | None (no token needed)                                 |
-| Read private repositories | `repo` or `contents: read`                             |
-| Pin/upgrade with `-R`     | `repo` or (`contents: write` + `pull-requests: write`) |
+| Operation                  | Required Scope                                         |
+| -------------------------- | ------------------------------------------------------ |
+| Read public repositories   | None (no token needed)                                 |
+| Read private repositories  | `repo` or `contents: read`                             |
+| Pin/upgrade with `-R`      | `repo` or (`contents: write` + `pull-requests: write`) |
+| Audit organization (`-A`)  | `repo` or `read:org` (for private repos in org)        |
 
 
-**Note**: Fine-grained tokens should have `contents: write` and `pull_requests: write` permissions.
+**Note**: Fine-grained tokens should have `contents: write` and `pull_requests: write` permissions for remote mode operations. For auditing private repositories in organizations, include `read:org` scope.
 
 ---
 
