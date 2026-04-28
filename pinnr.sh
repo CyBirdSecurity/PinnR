@@ -212,7 +212,10 @@ resolve_ref_to_sha() {
         local tag_sha
         tag_sha=$(echo "$response" | jq -r '.object.sha')
         local tag_obj
-        tag_obj=$(gh_api_get "/repos/$owner/$repo/git/tags/$tag_sha")
+        tag_obj=$(gh_api_get "/repos/$owner/$repo/git/tags/$tag_sha") || {
+            echo "[WARN] Could not dereference annotated tag for $owner/$repo" >&2
+            return 1
+        }
         echo "$tag_obj" | jq -r '.object.sha'
     else
         # Direct commit reference
@@ -357,9 +360,9 @@ extract_actions_from_workflow() {
     echo "$workflow_content" > "$temp_workflow"
 
     while IFS= read -r line; do
-        if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+        if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
             local uses_part
-            uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+            uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
             # Skip local actions
             if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -484,6 +487,64 @@ audit_single_repo() {
     if [[ "$has_unpinned" == true ]]; then
         ((AUDIT_REPOS_WITH_UNPINNED++)) || true
     fi
+
+    # Process composite action files
+    local actions_dirs_content
+    actions_dirs_content=$(gh_api_get "/repos/$repo_name/contents/.github/actions" 2>&1) || {
+        # No actions directory, skip silently
+        return 0
+    }
+
+    # Process each action directory
+    while IFS= read -r dir_obj; do
+        local dir_name
+        dir_name=$(echo "$dir_obj" | jq -r '.name')
+        local dir_type
+        dir_type=$(echo "$dir_obj" | jq -r '.type')
+
+        # Skip if not a directory
+        if [[ "$dir_type" != "dir" ]]; then
+            continue
+        fi
+
+        # Get contents of action directory
+        local action_dir_content
+        action_dir_content=$(gh_api_get "/repos/$repo_name/contents/.github/actions/$dir_name" 2>&1) || {
+            continue
+        }
+
+        # Look for action.yml or action.yaml
+        while IFS= read -r action_file_obj; do
+            local action_file_name
+            action_file_name=$(echo "$action_file_obj" | jq -r '.name')
+
+            # Only process action.yml or action.yaml
+            if [[ "$action_file_name" != "action.yml" ]] && [[ "$action_file_name" != "action.yaml" ]]; then
+                continue
+            fi
+
+            local download_url
+            download_url=$(echo "$action_file_obj" | jq -r '.download_url')
+
+            # Download action content (uses download URL, no auth required, doesn't count against rate limit)
+            local content
+            content=$(curl -sS --max-time 10 "$download_url" 2>&1) || {
+                echo "[WARN] Failed to download action $action_file_name from $repo_name/.github/actions/$dir_name" >&2
+                continue
+            }
+
+            # Track unpinned actions count before processing
+            local unpinned_before=$AUDIT_TOTAL_UNPINNED
+
+            # Extract and record actions
+            extract_actions_from_workflow "$csv_file" "$repo_name" ".github/actions/$dir_name/$action_file_name" "$content"
+
+            # Check if unpinned actions were found
+            if [[ $AUDIT_TOTAL_UNPINNED -gt $unpinned_before ]]; then
+                has_unpinned=true
+            fi
+        done < <(echo "$action_dir_content" | jq -c '.[]')
+    done < <(echo "$actions_dirs_content" | jq -c '.[]')
 }
 
 # Show progress indicator
@@ -631,12 +692,12 @@ process_workflow_file() {
     local skipped=0
 
     while IFS= read -r line; do
-        if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+        if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
             local indent
-            indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
+            indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
 
             local uses_part
-            uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+            uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
             # Check for local action
             if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -849,9 +910,18 @@ process_remote_repo() {
 
     # Get workflow files
     local workflows_content
-    workflows_content=$(gh_api_get "/repos/$repo/contents/.github/workflows") || {
-        echo "[ERROR] Could not fetch workflow files"
-        exit 1
+    workflows_content=$(gh_api_get "/repos/$repo/contents/.github/workflows" 2>&1) || {
+        if ! echo "$workflows_content" | grep -qi "404\|not found"; then
+            echo "[ERROR] Could not fetch workflow files"
+            exit 1
+        fi
+        workflows_content="[]"
+    }
+
+    # Get action files
+    local actions_dirs_content
+    actions_dirs_content=$(gh_api_get "/repos/$repo/contents/.github/actions" 2>&1) || {
+        actions_dirs_content="[]"
     }
 
     # Process each workflow file
@@ -863,6 +933,7 @@ process_remote_repo() {
     local changes_made=false
     local files_changed=0
 
+    # Process workflow files
     while IFS= read -r file_obj; do
         local file_name
         file_name=$(echo "$file_obj" | jq -r '.name')
@@ -894,12 +965,12 @@ process_remote_repo() {
         local file_changed=false
 
         while IFS= read -r line; do
-            if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+            if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
                 local indent
-                indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
+                indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
 
                 local uses_part
-                uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+                uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
                 # Skip local actions
                 if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -1013,6 +1084,177 @@ process_remote_repo() {
         rm "$temp_file" "$processed_file"
     done < <(echo "$workflows_content" | jq -c '.[]')
 
+    # Process composite action files
+    while IFS= read -r dir_obj; do
+        local dir_name
+        dir_name=$(echo "$dir_obj" | jq -r '.name')
+        local dir_type
+        dir_type=$(echo "$dir_obj" | jq -r '.type')
+
+        # Skip if not a directory
+        if [[ "$dir_type" != "dir" ]]; then
+            continue
+        fi
+
+        # Get contents of action directory
+        local action_dir_content
+        action_dir_content=$(gh_api_get "/repos/$repo/contents/.github/actions/$dir_name" 2>&1) || {
+            continue
+        }
+
+        # Look for action.yml or action.yaml
+        while IFS= read -r action_file_obj; do
+            local action_file_name
+            action_file_name=$(echo "$action_file_obj" | jq -r '.name')
+
+            # Only process action.yml or action.yaml
+            if [[ "$action_file_name" != "action.yml" ]] && [[ "$action_file_name" != "action.yaml" ]]; then
+                continue
+            fi
+
+            local file_path=".github/actions/$dir_name/$action_file_name"
+            local download_url
+            download_url=$(echo "$action_file_obj" | jq -r '.download_url')
+            local file_sha
+            file_sha=$(echo "$action_file_obj" | jq -r '.sha')
+
+            echo "[INFO] Processing $file_path"
+
+            # Download file content
+            local content
+            content=$(curl -sS "$download_url")
+
+            # Save to temp file
+            local temp_file
+            temp_file=$(mktemp)
+            echo "$content" > "$temp_file"
+
+            # Process file to pin actions
+            local processed_file
+            processed_file=$(mktemp)
+            local file_changed=false
+
+            while IFS= read -r line; do
+                if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
+                    local indent
+                    indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
+
+                    local uses_part
+                    uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
+
+                    # Skip local actions
+                    if echo "$uses_part" | grep -qE '^\.\/'; then
+                        echo "$line" >> "$processed_file"
+                        continue
+                    fi
+
+                    # Parse owner/repo@ref
+                    local action_with_ref
+                    action_with_ref=$(echo "$uses_part" | awk '{print $1}')
+
+                    if [[ ! "$action_with_ref" =~ @ ]]; then
+                        echo "$line" >> "$processed_file"
+                        continue
+                    fi
+
+                    local action_path="${action_with_ref%@*}"
+                    local current_ref="${action_with_ref#*@}"
+
+                    # Extract owner and repo
+                    local owner
+                    local repo_name
+                    if [[ "$action_path" == */* ]]; then
+                        owner=$(echo "$action_path" | cut -d'/' -f1)
+                        repo_name=$(echo "$action_path" | cut -d'/' -f2)
+                    else
+                        echo "$line" >> "$processed_file"
+                        continue
+                    fi
+
+                    # Check if already pinned
+                    if is_pinned "$current_ref"; then
+                        if [[ "$UPGRADE_MODE" == false ]]; then
+                            echo "$line" >> "$processed_file"
+                            continue
+                        fi
+                    fi
+
+                    # Determine target version and SHA
+                    local target_tag
+                    local target_sha
+
+                    if [[ "$UPGRADE_MODE" == true ]]; then
+                        # Upgrade mode - get latest version
+                        target_tag=$(get_latest_version "$owner" "$repo_name" 2>/dev/null) || {
+                            echo "$line" >> "$processed_file"
+                            continue
+                        }
+
+                        target_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$target_tag" 2>/dev/null) || {
+                            echo "$line" >> "$processed_file"
+                            continue
+                        }
+                    else
+                        # Default mode - pin to current ref
+                        target_tag="$current_ref"
+                        target_sha=$(resolve_ref_to_sha "$owner" "$repo_name" "$current_ref" 2>/dev/null) || {
+                            echo "$line" >> "$processed_file"
+                            continue
+                        }
+                    fi
+
+                    # Only change if different
+                    if [[ "$current_ref" != "$target_sha" ]]; then
+                        local new_line="${indent}uses: $action_path@$target_sha # $target_tag"
+                        echo "$new_line" >> "$processed_file"
+                        echo "| \`$file_path\` | \`$action_path\` | \`$current_ref\` → \`$target_sha\` (\`$target_tag\`) |" >> "$pr_table_file"
+                        file_changed=true
+                        echo "  [PIN] $action_path@$current_ref → $target_sha # $target_tag"
+                    else
+                        echo "$line" >> "$processed_file"
+                    fi
+                else
+                    echo "$line" >> "$processed_file"
+                fi
+            done < "$temp_file"
+
+            # If file changed, commit it to the remote branch
+            if [[ "$file_changed" == true ]]; then
+                echo "[INFO] Committing changes to $file_path"
+
+                # Base64 encode the new content (remove line breaks for GitHub API)
+                local new_content
+                if command -v base64 &>/dev/null; then
+                    # macOS base64 adds line breaks, remove them
+                    new_content=$(base64 < "$processed_file" | tr -d '\n')
+                else
+                    echo "[ERROR] base64 command not found"
+                    exit 1
+                fi
+
+                # Update file on remote branch
+                local update_data
+                update_data=$(jq -n \
+                    --arg message "Pin actions in $action_file_name" \
+                    --arg content "$new_content" \
+                    --arg sha "$file_sha" \
+                    --arg branch "$BRANCH_NAME" \
+                    '{message: $message, content: $content, sha: $sha, branch: $branch}')
+
+                gh_api_put "/repos/$repo/contents/$file_path" "$update_data" > /dev/null || {
+                    echo "[ERROR] Failed to update $file_path"
+                    rm "$temp_file" "$processed_file" "$pr_table_file"
+                    exit 1
+                }
+
+                changes_made=true
+                ((files_changed++))
+            fi
+
+            rm "$temp_file" "$processed_file"
+        done < <(echo "$action_dir_content" | jq -c '.[]')
+    done < <(echo "$actions_dirs_content" | jq -c '.[]')
+
     if [[ "$changes_made" == false ]]; then
         echo "[INFO] No changes needed - all actions are already pinned"
         # Delete the branch we created
@@ -1103,6 +1345,10 @@ EXAMPLES:
     pinnr.sh -A myorg                 # Audit all repos in organization (full report)
     pinnr.sh -A myorg -O              # Audit organization (unpinned actions only)
 
+SCOPE:
+    PinnR processes both .github/workflows and .github/actions directories.
+    It pins external actions in workflow files and composite action files.
+
 AUTHENTICATION:
     Use 'gh auth login' (recommended) or set GITHUB_TOKEN environment variable.
 
@@ -1173,15 +1419,35 @@ main() {
 
     # Local mode
     local exit_code=0
+    local has_workflows=false
+    local has_actions=false
 
+    # Process workflows
     if [[ -d "$target_path/.github/workflows" ]]; then
+        has_workflows=true
         for workflow in "$target_path/.github/workflows"/*.yml "$target_path/.github/workflows"/*.yaml; do
             if [[ -f "$workflow" ]]; then
                 process_workflow_file "$workflow" || exit_code=1
             fi
         done
-    else
-        echo "[ERROR] No .github/workflows directory found at $target_path"
+    fi
+
+    # Process composite actions
+    if [[ -d "$target_path/.github/actions" ]]; then
+        has_actions=true
+        for action_dir in "$target_path/.github/actions"/*; do
+            if [[ -d "$action_dir" ]]; then
+                for action_file in "$action_dir/action.yml" "$action_dir/action.yaml"; do
+                    if [[ -f "$action_file" ]]; then
+                        process_workflow_file "$action_file" || exit_code=1
+                    fi
+                done
+            fi
+        done
+    fi
+
+    if [[ "$has_workflows" == false ]] && [[ "$has_actions" == false ]]; then
+        echo "[ERROR] No .github/workflows or .github/actions directory found at $target_path"
         exit 1
     fi
 
