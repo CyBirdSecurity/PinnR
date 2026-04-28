@@ -212,7 +212,10 @@ resolve_ref_to_sha() {
         local tag_sha
         tag_sha=$(echo "$response" | jq -r '.object.sha')
         local tag_obj
-        tag_obj=$(gh_api_get "/repos/$owner/$repo/git/tags/$tag_sha")
+        tag_obj=$(gh_api_get "/repos/$owner/$repo/git/tags/$tag_sha") || {
+            echo "[WARN] Could not dereference annotated tag for $owner/$repo" >&2
+            return 1
+        }
         echo "$tag_obj" | jq -r '.object.sha'
     else
         # Direct commit reference
@@ -357,9 +360,9 @@ extract_actions_from_workflow() {
     echo "$workflow_content" > "$temp_workflow"
 
     while IFS= read -r line; do
-        if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+        if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
             local uses_part
-            uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+            uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
             # Skip local actions
             if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -689,12 +692,12 @@ process_workflow_file() {
     local skipped=0
 
     while IFS= read -r line; do
-        if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+        if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
             local indent
-            indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
+            indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
 
             local uses_part
-            uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+            uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
             # Check for local action
             if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -962,12 +965,12 @@ process_remote_repo() {
         local file_changed=false
 
         while IFS= read -r line; do
-            if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+            if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
                 local indent
-                indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
+                indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
 
                 local uses_part
-                uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+                uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
                 # Skip local actions
                 if echo "$uses_part" | grep -qE '^\.\/'; then
@@ -1132,12 +1135,12 @@ process_remote_repo() {
             local file_changed=false
 
             while IFS= read -r line; do
-                if echo "$line" | grep -qE '^[[:space:]]*uses:[[:space:]]+'; then
+                if echo "$line" | grep -qE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+'; then
                     local indent
-                    indent=$(echo "$line" | sed 's/^\([[:space:]]*\)uses:.*/\1/')
+                    indent=$(echo "$line" | sed 's/^\([[:space:]]*\)\(-[[:space:]]*\)\{0,1\}uses:.*/\1\2/')
 
                     local uses_part
-                    uses_part=$(echo "$line" | sed 's/^[[:space:]]*uses:[[:space:]]*//; s/[[:space:]]*$//')
+                    uses_part=$(echo "$line" | sed 's/^[[:space:]]*\(-[[:space:]]*\)\{0,1\}uses:[[:space:]]*//; s/[[:space:]]*$//')
 
                     # Skip local actions
                     if echo "$uses_part" | grep -qE '^\.\/'; then
